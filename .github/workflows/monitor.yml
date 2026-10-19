@@ -1,0 +1,66 @@
+# Monitor externo do Hub de Dados do Sienge (RDO). Repositório PÚBLICO só com este arquivo: Actions grátis.
+# GET no /saude público (sem dado de negócio: só estado do MCP e nível do monitor interno). Falha quando:
+#   - não há resposta ou o HTTP não é 200 (servidor, túnel ou MCP fora; ou monitor interno crítico/desatualizado);
+#   - o MCP diz estado != ok;
+#   - o monitor interno não está "ok" nem "aviso".
+# Workflow agendado que falha => o GitHub manda e-mail a quem alterou o cron por último.
+# Keepalive: em repositório público, agendamentos são desligados depois de 60 dias sem atividade; o job
+# `manter-ativo` faz um commit no dia 1 de cada mês para evitar isso.
+name: Monitor do hub
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'   # a cada 15 min (UTC), fora do minuto 0
+    - cron: '41 9 1 * *'            # dia 1 de cada mês: keepalive
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: monitor-hub
+  cancel-in-progress: false
+
+jobs:
+  saude:
+    if: github.event.schedule != '41 9 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: GET /saude
+        env:
+          URL: https://hub.rdotec.uk/saude
+        run: |
+          set -u
+          rm -f corpo.json
+          codigo=$(curl -sS -o corpo.json -w '%{http_code}' --max-time 20 --retry 2 --retry-delay 15 \
+                   --retry-connrefused -A 'sienge-hub-monitor-externo' -H 'Cache-Control: no-cache' "$URL") || true
+          codigo=${codigo:-000}
+          estado=$(jq -r '.estado // "?"' corpo.json 2>/dev/null || echo '?')
+          nivel=$(jq -r '.monitor.nivel // "ausente"' corpo.json 2>/dev/null || echo 'ilegivel')
+          verificado=$(jq -r '.monitor.verificado_em // "-"' corpo.json 2>/dev/null || echo '-')
+          alertas=$(jq -c '.monitor.alertas // []' corpo.json 2>/dev/null || echo '[]')
+          echo "HTTP $codigo | MCP estado=$estado | monitor=$nivel (verificado_em $verificado) | alertas=$alertas"
+          if [ "$codigo" != "200" ] || [ "$estado" != "ok" ] || { [ "$nivel" != "ok" ] && [ "$nivel" != "aviso" ]; }; then
+            echo "::error title=Hub Sienge fora do normal::HTTP $codigo, estado=$estado, monitor=$nivel, alertas=$alertas"
+            exit 1
+          fi
+          if [ "$nivel" = "aviso" ]; then
+            echo "::warning title=Hub Sienge com aviso::alertas=$alertas"
+          fi
+
+  manter-ativo:
+    if: github.event.schedule == '41 9 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: commit de keepalive
+        run: |
+          date -u +%Y-%m-%dT%H:%M:%SZ > ultimo-keepalive.txt
+          git config user.name 'hub-monitor[bot]'
+          git config user.email 'hub-monitor@users.noreply.github.com'
+          git add ultimo-keepalive.txt
+          git commit -m "keepalive $(date -u +%Y-%m)"
+          git push
